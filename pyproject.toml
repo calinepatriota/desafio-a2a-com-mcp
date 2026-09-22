@@ -1,0 +1,20 @@
+[project]
+name = "desafio-a-ponte"
+version = "1.0.0"
+description = "A Ponte: servidor MCP (Streamable HTTP + MRTR) e agente A2A que o consome por dentro."
+requires-python = ">=3.10"
+
+# Versoes travadas. O SDK oficial do MCP na v2 (revisao 2026-07-28 da spec) traz
+# uvicorn/starlette/cryptography/pydantic como dependencias transitivas; sao
+# fixadas aqui para reprodutibilidade. NAO ha nenhum SDK de provedor de LLM: o
+# agente e deterministico, decide por regra.
+dependencies = [
+    "mcp==2.2.0",
+    "starlette==1.6.0",
+    "uvicorn==0.53.0",
+    "cryptography==50.0.1",
+    "pydantic==2.13.5",
+]
+
+[tool.setuptools]
+py-modules = []
