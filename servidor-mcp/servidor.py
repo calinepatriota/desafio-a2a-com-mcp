@@ -13,6 +13,7 @@ cliente retorna num request novo levando `inputResponses` + `requestState`.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, time, timedelta, timezone
@@ -21,7 +22,6 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, create_model
 
-from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -54,8 +54,6 @@ ERRO_SEM_ALTERNATIVA = "Sem alternativas disponiveis no intervalo"
 
 
 def _carregar_json(nome: str) -> Any:
-    import json
-
     return json.loads((DADOS / nome).read_text(encoding="utf-8"))
 
 
@@ -177,19 +175,52 @@ class SalaEscolhida(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
-class LogPorRequest:
-    """Middleware que registra no stderr o metodo, o id e o traceparent de cada
-    request recebido (M3 aula 6: stderr no lugar do logging depreciado)."""
+class LogNaBorda:
+    """Middleware ASGI que registra no stderr o metodo, o id e o traceparent de
+    CADA request recebido (M3 aula 6: stderr no lugar do logging depreciado).
 
-    async def __call__(self, ctx: ServerRequestContext[Any, Any], call_next: CallNext) -> HandlerResult:
-        meta = (ctx.params or {}).get("_meta") or {}
-        traceparent = meta.get("traceparent")
-        print(
-            f"[mcp] method={ctx.method} id={ctx.request_id} traceparent={traceparent}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return await call_next(ctx)
+    Fica na borda, antes da validacao de envelope e da verificacao do
+    requestState, para que ate um request rejeitado (envelope incompleto,
+    requestState adulterado) apareca no log."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)  # encaminha lifespan etc.
+            return
+        bufferizadas: list[dict[str, Any]] = []
+        corpo = b""
+        while True:
+            mensagem = await receive()
+            bufferizadas.append(mensagem)
+            if mensagem["type"] == "http.request":
+                corpo += mensagem.get("body", b"")
+                if not mensagem.get("more_body", False):
+                    break
+            else:
+                break
+        try:
+            dados = json.loads(corpo)
+            if isinstance(dados, dict):
+                meta = (dados.get("params") or {}).get("_meta") or {}
+                traceparent = meta.get("traceparent") if isinstance(meta, dict) else None
+                print(
+                    f"[mcp] method={dados.get('method')} id={dados.get('id')} traceparent={traceparent}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception:
+            pass
+        iterador = iter(bufferizadas)
+
+        async def receive_replay() -> dict[str, Any]:
+            for mensagem in iterador:
+                return mensagem
+            return await receive()
+
+        await self.app(scope, receive_replay, send)
 
 
 def _segredo() -> bytes:
@@ -211,7 +242,6 @@ server: MCPServer = MCPServer(
     # keys=[...] (nao ephemeral) para que um requestState continue valido apos
     # um restart do processo: o estado viaja no token, nao na memoria.
     request_state_security=RequestStateSecurity(keys=[_segredo()], ttl=600.0),
-    middleware=[LogPorRequest()],
 )
 
 
@@ -288,17 +318,21 @@ def politica_de_uso() -> str:
 
 
 def main() -> None:
+    import uvicorn
+
     host = os.environ.get("MCP_HOST", "127.0.0.1")
     port = int(os.environ.get("MCP_PORT", "7301"))
     print(f"[mcp] central-de-salas ouvindo em http://{host}:{port}/mcp", file=sys.stderr, flush=True)
-    server.run(
-        transport="streamable-http",
-        host=host,
-        port=port,
+    # json_response=True: cada tools/call e respondido em application/json (o
+    # validador faz json.loads da resposta). O app e embrulhado por LogNaBorda
+    # para registrar todo request no stderr.
+    app = server.streamable_http_app(
         streamable_http_path="/mcp",
         json_response=True,
         stateless_http=True,
+        host=host,
     )
+    uvicorn.run(LogNaBorda(app), host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":
